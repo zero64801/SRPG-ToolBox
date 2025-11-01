@@ -1,4 +1,4 @@
-﻿/*
+/*
  *  File: SRPG_Unpacker.cpp
  *  Copyright (c) 2024 Sinflower
  *
@@ -85,13 +85,35 @@ std::wstring RestoreFileName(const std::string& filename, const std::string& sec
 	return fN;
 }
 
+void SaveNameMapping(const fs::path& outFolder, const std::string& originalName, const std::string& newName)
+{
+	fs::path mappingFile = outFolder / "name_mapping.json";
+	nlohmann::ordered_json mapping;
+
+	if (fs::exists(mappingFile))
+	{
+		std::ifstream ifs(mappingFile);
+		if (ifs.is_open())
+		{
+			mapping = nlohmann::ordered_json::parse(ifs);
+			ifs.close();
+		}
+	}
+
+	mapping[newName] = originalName;
+
+	std::ofstream ofs(mappingFile);
+	ofs << mapping.dump(4);
+	ofs.close();
+}
+
 void ProcessFile(const std::wstring& dtsFolder, const fs::path& path, const fs::path& outFolder, const nlohmann::ordered_json& j)
 {
 	const std::wstring parentFolder = path.parent_path().wstring();
-	std::wstring localPath          = parentFolder.substr(dtsFolder.size() + 1);
+	std::wstring localPath = parentFolder.substr(dtsFolder.size() + 1);
 
 	const std::string secName = GetSecNameFromPath(ws2s(localPath));
-	std::wstring ext          = path.extension().wstring();
+	std::wstring ext = path.extension().wstring();
 
 	std::wstring fN = path.stem().wstring();
 
@@ -100,6 +122,8 @@ void ProcessFile(const std::wstring& dtsFolder, const fs::path& path, const fs::
 
 	if (ext == L".srk")
 	{
+		std::string originalFileName = ws2s(fN);
+
 		std::wstring inSecPath = localPath.substr(secName.size());
 
 		std::vector<std::wstring> folders = SplitString(inSecPath, L'\\');
@@ -108,7 +132,9 @@ void ProcessFile(const std::wstring& dtsFolder, const fs::path& path, const fs::
 		for (std::wstring& f : folders)
 		{
 			if (f.empty()) continue;
+			std::string originalFolderName = ws2s(f);
 			f = RestoreFileName(ws2s(f), secName, j);
+			SaveNameMapping(outFolder, originalFolderName, ws2s(f));
 		}
 
 		// Rebuild the path
@@ -116,6 +142,8 @@ void ProcessFile(const std::wstring& dtsFolder, const fs::path& path, const fs::
 
 		fN = RestoreFileName(ws2s(fN), secName, j);
 		Crypt::DecryptData(data);
+
+		SaveNameMapping(outFolder, originalFileName, ws2s(fN));
 	}
 
 	ext = GetFileExtension(data);
@@ -123,6 +151,71 @@ void ProcessFile(const std::wstring& dtsFolder, const fs::path& path, const fs::
 	fs::path outPath = outFolder / localPath / std::format(L"{}{}", fN, ext);
 
 	// Make sure the folder exists
+	fs::create_directories(outPath.parent_path());
+
+	FileWriter::WriteFile(outPath.wstring(), data);
+}
+
+std::string GetOriginalFileNameFromMapping(const fs::path& inputFolder, const std::string& decodedName)
+{
+	fs::path mappingFile = inputFolder / "name_mapping.json";
+
+	if (!fs::exists(mappingFile))
+		return decodedName;
+
+	try
+	{
+		std::ifstream ifs(mappingFile);
+		nlohmann::ordered_json mapping = nlohmann::ordered_json::parse(ifs);
+		ifs.close();
+
+		if (mapping.contains(decodedName))
+			return mapping[decodedName].get<std::string>();
+	}
+	catch ([[maybe_unused]] const std::exception& e)
+	{
+		std::cerr << "Error reading name mapping: " << e.what() << std::endl;
+	}
+
+	return decodedName;
+}
+
+void ProcessFileForPacking(const fs::path& path, const std::wstring& outputBase, const fs::path& inputFolder, const fs::path& relativePathBase, const std::string& topLevelFolder)
+{
+	std::vector<uint8_t> data;
+	FileReader::ReadFile(path.wstring(), data);
+
+	fs::path relativePath = fs::relative(path.parent_path(), relativePathBase);
+
+	std::string stem = ws2s(path.stem().wstring());
+	std::string originalName = GetOriginalFileNameFromMapping(inputFolder, stem);
+
+	Crypt::EncryptData(data);
+
+	std::wstring outputPath = std::format(L"{}\\{}", outputBase, s2ws(topLevelFolder));
+
+	if (!relativePath.empty() && relativePath != ".")
+	{
+		std::vector<std::wstring> pathParts;
+		for (const auto& part : relativePath)
+		{
+			if (!part.empty() && part != L".")
+			{
+				std::string partStr = ws2s(part.wstring());
+				std::string originalPartName = GetOriginalFileNameFromMapping(inputFolder, partStr);
+				pathParts.push_back(s2ws(originalPartName));
+			}
+		}
+
+		if (!pathParts.empty())
+		{
+			std::wstring subPath = JoinString(pathParts, L'\\');
+			outputPath = std::format(L"{}\\{}\\{}", outputBase, s2ws(topLevelFolder), subPath);
+		}
+	}
+
+	fs::path outPath = fs::path(outputPath) / std::format(L"{}.srk", s2ws(originalName));
+
 	fs::create_directories(outPath.parent_path());
 
 	FileWriter::WriteFile(outPath.wstring(), data);
@@ -143,6 +236,32 @@ void CopyAndDecryptOpenData(const std::wstring& dtsFolder, const fs::path& outFo
 			{
 				if (entry.is_regular_file())
 					ProcessFile(dtsFolder, entry.path(), outFolder, j);
+			}
+			std::cout << "Done" << std::endl;
+		}
+	}
+}
+
+void EncryptAndCopyOpenData(const fs::path& inputFolder, const std::wstring& outputFolder, const nlohmann::ordered_json& j)
+{
+	const static std::vector<std::wstring> FOLDER_NAMES = { L"Graphics", L"UI", L"Audio", L"Fonts", L"Video" };
+
+	for (const auto& folder : FOLDER_NAMES)
+	{
+		fs::path sourceFolderPath = inputFolder / folder;
+
+		if (fs::exists(sourceFolderPath))
+		{
+			std::cout << " - Processing folder for packing: " << ws2s(sourceFolderPath.wstring()) << " ... " << std::flush;
+
+			std::string topLevelFolder = ws2s(folder);
+
+			for (const auto& entry : fs::recursive_directory_iterator(sourceFolderPath))
+			{
+				if (entry.is_regular_file() && entry.path().extension() != L".json")
+				{
+					ProcessFileForPacking(entry.path(), outputFolder, inputFolder, sourceFolderPath, topLevelFolder);
+				}
 			}
 			std::cout << "Done" << std::endl;
 		}
@@ -238,6 +357,38 @@ void pack(const fs::path& inFolder, const fs::path& outFile = L"output.dts")
 		testFile.close();
 	}
 
+	nlohmann::ordered_json config;
+	std::vector<BYTE> data;
+	readDatFile(inFolder, data);
+	readConfigFile(inFolder, config);
+
+	DWORD version = 0;
+	DWORD resFlag = 0;
+
+	if (config.contains("fileVersion"))
+		version = config["fileVersion"].get<DWORD>();
+	else
+		throw std::runtime_error("Config file does not contain 'fileVersion'");
+
+	if (config.contains("segments"))
+		resFlag = config["segments"].get<DWORD>();
+
+	SRPG_Project sp({ version, resFlag, data });
+	sp.SetupInternalResources(config);
+
+	if (version >= NEW_CRYPT_START_VERSION)
+	{
+		Crypt::SwitchToCustomKey(sp.GetEncryptionKey());
+	}
+
+	fs::path outputDir = outFile.parent_path();
+	if (outputDir.empty())
+		outputDir = fs::current_path();
+
+	std::cout << "Encrypting and copying data not in the archive ... " << std::endl;
+	EncryptAndCopyOpenData(inFolder, outputDir.wstring(), sp.GetResMapping());
+	std::cout << "Finished encrypting and copying data" << std::endl;
+
 	DTSTool dtsT;
 	dtsT.Pack(inFolder, outFile);
 }
@@ -300,8 +451,8 @@ int main(int argc, char* argv[])
 	argv = app.ensure_utf8(argv);
 
 	std::wstring defaultUnpack = L"output";
-	std::wstring defaultPack   = L"output.dts";
-	std::wstring defaultPatch  = L"patch";
+	std::wstring defaultPack = L"output.dts";
+	std::wstring defaultPatch = L"patch";
 
 	std::wstring input;
 	app.add_option("INPUT", input, "<data.dts>\n<data_folder>\n<project.dat>")->required();
